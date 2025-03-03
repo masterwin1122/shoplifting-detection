@@ -1,14 +1,22 @@
 {
+  "$schema": "https://railway.com/railway.schema.json",
   "build": {
+    "builder": "NIXPACKS",
     "nixpacks": {
-      "packages": [
-        "python3",
-        "gcc",
-        "libGL"
-      ]
+      "packages": ["python3", "gcc", "libGL", "ffmpeg"]
     }
   },
   "deploy": {
-    "startCommand": "python app.py"
+    "runtime": "V2",
+    "numReplicas": 1,
+    "startCommand": "python app.py",
+    "sleepApplication": false,
+    "multiRegionConfig": {
+      "us-west2": {
+        "numReplicas": 1
+      }
+    },
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
   }
 }
