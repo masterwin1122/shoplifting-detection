@@ -6,6 +6,7 @@
       "packages": ["python3", "gcc", "libglvnd", "ffmpeg"]
     }
   },
+
   "deploy": {
     "runtime": "V2",
     "numReplicas": 1,
