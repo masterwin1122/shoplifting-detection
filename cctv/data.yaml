@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['Customer-Bagpack', 'Product', 'Product-Picked', 'Regular', 'Shoplifting', 'Shopping-Cart']
+
+roboflow:
+  workspace: shoplift-vua4d
+  project: cc-tv-footage-annotation-b8-aof30
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/shoplift-vua4d/cc-tv-footage-annotation-b8-aof30/dataset/1

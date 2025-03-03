@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['persone']
+
+roboflow:
+  workspace: supermercati
+  project: furti
+  version: 5
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/supermercati/furti/dataset/5
