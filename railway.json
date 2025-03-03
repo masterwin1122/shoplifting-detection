@@ -3,7 +3,7 @@
   "build": {
     "builder": "NIXPACKS",
     "nixpacks": {
-      "packages": ["python3", "gcc", "libGL", "ffmpeg"]
+      "packages": ["python3", "gcc", "libglvnd", "ffmpeg"]
     }
   },
   "deploy": {
