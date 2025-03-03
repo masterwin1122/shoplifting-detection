@@ -21,3 +21,16 @@
     "restartPolicyMaxRetries": 10
   }
 }
+
+
+
+
+{
+  "build": {
+    "base": "ubuntu",
+    "setup": [
+      "apt-get update && apt-get install -y libgl1-mesa-glx"
+    ],
+    "install": "pip install -r requirements.txt"
+  }
+}
