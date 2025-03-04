@@ -1,5 +1,2 @@
 [build]
-# Install libGL for OpenCV
-build_cmds = [
-    "apt-get update && apt-get install -y libgl1-mesa-glx"
-]
+nixpacksPkgs = ["mesa", "mesa-dri-drivers", "mesa-utils", "ffmpeg", "libglvnd", "libglvnd-glx"]
