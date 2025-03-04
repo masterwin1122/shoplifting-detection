@@ -1,11 +1,19 @@
 {
+  "$schema": "https://railway.com/railway.schema.json",
   "build": {
-    "builder": "Nixpacks",
-    "buildCommand": "pip install -r requirements.txt"
+    "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python app.py",
+    "runtime": "V2",
+    "numReplicas": 1,
+    "sleepApplication": false,
+    "multiRegionConfig": {
+      "us-west2": {
+        "numReplicas": 1
+      }
+    },
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 5
+    "restartPolicyMaxRetries": 10,
+    "startCommand": "python app.py"
   }
 }
