@@ -1,2 +1,0 @@
-[build]
-nixpacksPkgs = ["mesa", "mesa-dri-drivers", "mesa-utils", "ffmpeg", "libglvnd", "libglvnd-glx"]
