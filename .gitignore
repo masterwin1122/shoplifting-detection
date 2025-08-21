@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+uploads/
+runs/
+app*.out
+*.mp4 *.mov *.avi *.mkv *.webm

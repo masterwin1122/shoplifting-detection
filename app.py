@@ -1,41 +1,379 @@
-import os
+import os, time, json, uuid, queue, math
+from collections import defaultdict
+from typing import Dict, List, Tuple
+
+import numpy as np
 import cv2
-from flask import Flask, Response
+from flask import Flask, Response, request, redirect, url_for, abort
+from werkzeug.utils import secure_filename
 from ultralytics import YOLO
 
 app = Flask(__name__)
 
-# Corrected model path
-MODEL_PATH = "runs/detect/train/weights/best.pt"
+# ------------ Config ------------
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploads"))
 
-# Check if model exists
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"❌ Model not found at {MODEL_PATH}. Check the path!")
+MODEL_PATH   = os.getenv("MODEL_PATH", "runs/detect/train/weights/best.pt")
+CONF         = float(os.getenv("CONF", "0.45"))
+IMG_SIZE     = int(os.getenv("IMG_SIZE", "640"))
+DEVICE       = os.getenv("DEVICE", "")
+ALERT_FRAMES = int(os.getenv("ALERT_FRAMES", "12"))
+MODE         = os.getenv("MODE", "bag")    # person | bag | zones | weapon | grabrun
+MAX_W        = int(os.getenv("MAX_W", "960"))
+ROIS_PATH    = os.getenv("ROIS_PATH", os.path.join(BASE_DIR, "rois.json"))
+ALLOWED_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-# Load YOLO model
+# Tunables
+BAG_NAMES     = os.getenv("BAG_NAMES", "backpack,handbag")
+THREAT_NAMES  = os.getenv("THREAT_NAMES", "knife,scissors")     # add 'gun' if your model supports it
+GRAB_NAMES    = os.getenv("GRAB_NAMES", "bottle,cell phone,book")
+EXIT_TIME_S   = float(os.getenv("EXIT_TIME_S", "10"))           # must reach exit within this time after grab
+SPEED_PXPS    = float(os.getenv("SPEED_PXPS", "150"))           # pixels/sec threshold for "running"
+
+# Playback controls
+MAX_SECS     = float(os.getenv("MAX_SECS", "0"))                # 0 = no cap
+LOOP_UPLOADS = int(os.getenv("LOOP_UPLOADS", "0"))              # 0 = uploaded files don't loop
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Fallback model
+if not (MODEL_PATH.endswith(".pt") and os.path.exists(MODEL_PATH)):
+    MODEL_PATH = os.getenv("MODEL_FALLBACK", "yolov8n.pt")
+
 model = YOLO(MODEL_PATH)
-print("✅ Model loaded successfully!")
+print(f"✅ Loaded model: {MODEL_PATH}, MODE={MODE}")
 
-def generate_frames():
-    cap = cv2.VideoCapture(0)  # Use webcam (0) or provide video file path
-    while True:
-        success, frame = cap.read()
-        if not success:
-            break
+# names map (Ultralytics)
+NAMES = getattr(model.model, "names", {})
+if isinstance(NAMES, list):
+    NAMES = {i: n for i, n in enumerate(NAMES)}
 
-        results = model(frame)
-        for result in results:
-            frame = result.plot()
+def cls_ids_from_names(csv_str: str):
+    want = set()
+    targets = [x.strip().lower() for x in csv_str.split(",") if x.strip()]
+    for i, n in NAMES.items():
+        if str(n).lower() in targets:
+            want.add(int(i))
+    return want
 
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
+BAG_IDS    = cls_ids_from_names(BAG_NAMES) or {24, 26}  # backpack, handbag (COCO)
+THREAT_IDS = cls_ids_from_names(THREAT_NAMES)
+GRAB_IDS   = cls_ids_from_names(GRAB_NAMES)
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+print(f"Classes: bag={BAG_IDS}, threat={THREAT_IDS}, grab={GRAB_IDS}")
 
-@app.route('/video_feed')
+# ----- Alerts + stop flags (SSE) -----
+ALERT_QUEUES: Dict[str, "queue.Queue[str]"] = {}
+STOP_FLAGS: Dict[str, bool] = {}
+
+def notify(chan: str, msg: str):
+    q = ALERT_QUEUES.get(chan)
+    if q:
+        try: q.put_nowait(msg)
+        except queue.Full: pass
+
+# ----- Geometry / zones -----
+def load_rois(path):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return {k: [tuple(map(int, p)) for p in v] for k, v in data.items()}
+    except Exception as e:
+        print(f"⚠️  Could not load ROIs: {e}")
+        return {}
+ROIS = load_rois(ROIS_PATH)
+
+def point_in_poly(px, py, poly: List[Tuple[int,int]]):
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > py) != (y2 > py):
+            xin = (px < (x2 - x1) * (py - y1) / (y2 - y1 + 1e-9) + x1)
+            if xin:
+                inside = not inside
+    return inside
+
+def which_zone(cx, cy):
+    for name, poly in ROIS.items():
+        if point_in_poly(cx, cy, poly):
+            return name
+    return None
+
+def overlap(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    return iw * ih
+
+def open_capture(src: str):
+    if isinstance(src, str) and src.startswith("rtsp://"):
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+    return cv2.VideoCapture(0) if src == "0" else cv2.VideoCapture(src)
+
+def put_text(img, text, org, scale=0.6, color=(255,255,255), bg=(0,0,0), thick=1):
+    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    x, y = org
+    cv2.rectangle(img, (x, y - h - base), (x + w, y + base // 2), bg, -1)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+# ---- per-track state
+trigger_frames = defaultdict(int)
+tracks = defaultdict(lambda: {
+    "visited_shelf": False, "visited_checkout": False, "last_zone": None,
+    "last_cx": None, "last_cy": None, "last_ts": None, "speed": 0.0,
+    "grabbed": False, "t_grab": None, "t_shelf": None, "t_exit": None
+})
+
+# ----- Streaming with detection -----
+def generate_frames(src_path: str, chan: str, loop: bool = True):
+    cap = open_capture(src_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {src_path}")
+    alerted_ids = set()
+    t0 = time.time()
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                if loop and os.path.exists(src_path):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                break
+
+            h, w = frame.shape[:2]
+            if w > MAX_W:
+                new_h = int(h * (MAX_W / float(w)))
+                frame = cv2.resize(frame, (MAX_W, new_h), interpolation=cv2.INTER_AREA)
+
+            res = model.track(frame, conf=CONF, imgsz=IMG_SIZE,
+                              device=DEVICE if DEVICE else None,
+                              persist=True, verbose=False)
+            if not res:
+                continue
+            r = res[0]
+            boxes = getattr(r, "boxes", None)
+
+            person, bags, threats, items = [], [], [], []
+            if boxes is not None and len(boxes) > 0:
+                xyxy = boxes.xyxy.cpu().numpy()
+                clss = boxes.cls.cpu().numpy().astype(int)
+                confs = boxes.conf.cpu().numpy()
+                ids   = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else [-1]*len(xyxy)
+
+                for (b, c, s, tid) in zip(xyxy, clss, confs, ids):
+                    x1, y1, x2, y2 = b.astype(int)
+                    if c == 0:  # person
+                        person.append(((x1,y1,x2,y2), tid, s))
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+                        put_text(frame, f"id:{tid} {s:.2f}", (x1, max(20,y1-5)))
+                    elif c in BAG_IDS:
+                        bags.append((x1,y1,x2,y2))
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,200,255),2)
+                        put_text(frame, NAMES.get(c, str(c)), (x1, max(20,y1-5)), scale=0.5, bg=(30,30,0))
+                    elif c in THREAT_IDS:
+                        threats.append((x1,y1,x2,y2))
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,0,255),2)
+                        put_text(frame, NAMES.get(c, str(c)), (x1, max(20,y1-5)), scale=0.6, bg=(70,0,0))
+                    elif c in GRAB_IDS:
+                        items.append((x1,y1,x2,y2))
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(255,0,0),2)
+                        put_text(frame, NAMES.get(c, str(c)), (x1, max(20,y1-5)), scale=0.5, bg=(40,0,0))
+                    else:
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,255),1)
+
+            newly_alerted = False
+            now = time.time()
+
+            for (pb, pid, _conf) in person:
+                x1,y1,x2,y2 = pb
+                cx, cy = (x1+x2)//2, (y1+y2)//2
+
+                st = tracks[pid]
+                if st["last_ts"] is not None:
+                    dt = max(1e-3, now - st["last_ts"])
+                    dx, dy = cx - st["last_cx"], cy - st["last_cy"]
+                    st["speed"] = math.hypot(dx, dy) / dt
+                st["last_cx"], st["last_cy"], st["last_ts"] = cx, cy, now
+                put_text(frame, f"v={st['speed']:.0f}px/s", (x1, y2+18), scale=0.5, bg=(0,0,0))
+
+                z = which_zone(cx, cy) if (MODE in ("zones","grabrun")) else None
+                if z:
+                    st["last_zone"] = z
+                    if z == "shelf":
+                        st["visited_shelf"] = True
+                        st["t_shelf"] = st["t_shelf"] or now
+                    if z == "checkout":
+                        st["visited_checkout"] = True
+                    if z == "exit":
+                        st["t_exit"] = now
+
+                touched = False
+                if MODE == "person":
+                    touched = True
+                elif MODE == "bag":
+                    touched = any(overlap(pb, bb) > 0 for bb in bags)
+                elif MODE == "zones":
+                    touched = (z == "exit" and st["visited_shelf"] and not st["visited_checkout"])
+                elif MODE == "weapon":
+                    touched = any(overlap(pb, wb) > 0 for wb in threats)
+                elif MODE == "grabrun":
+                    if z == "shelf" and any(overlap(pb, ib) > 0 for ib in items):
+                        st["grabbed"] = True
+                        if st["t_grab"] is None: st["t_grab"] = now
+                    if st["grabbed"] and z == "exit":
+                        t_since = (now - (st["t_grab"] or now+999))
+                        if t_since <= EXIT_TIME_S and st["speed"] >= SPEED_PXPS:
+                            touched = True
+
+                immediate = MODE in ("weapon", "grabrun")
+                if touched:
+                    if immediate:
+                        trigger_frames[pid] = ALERT_FRAMES
+                    else:
+                        trigger_frames[pid] = min(ALERT_FRAMES, trigger_frames[pid] + 1)
+                else:
+                    trigger_frames[pid] = max(0, trigger_frames[pid] - 1)
+
+                if trigger_frames[pid] >= ALERT_FRAMES and pid not in alerted_ids:
+                    alerted_ids.add(pid); newly_alerted = True
+
+            if newly_alerted:
+                notify(chan, f"ALERT: possible threat ({MODE})")
+
+            if MODE in ("zones","grabrun") and ROIS:
+                for name, poly in ROIS.items():
+                    pts = np.array(poly, dtype=np.int32).reshape((-1,1,2))
+                    cv2.polylines(frame, [pts], True, (80,80,80), 1)
+                    put_text(frame, name, poly[0], scale=0.5, bg=(50,50,50))
+
+            if alerted_ids:
+                put_text(frame, "ALERT", (10,30), scale=0.8, bg=(0,0,255))
+
+            ok, buf = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+
+            # one-pass / stop / max_secs
+            if STOP_FLAGS.get(chan):
+                break
+            if MAX_SECS > 0 and (time.time() - t0) >= MAX_SECS:
+                break
+    finally:
+        cap.release()
+        try:
+            ALERT_QUEUES.pop(chan, None)
+            STOP_FLAGS.pop(chan, None)
+        except Exception:
+            pass
+
+# ---------- Routes ----------
+@app.route("/", methods=["GET"])
+def index():
+    return f"""
+    <html><body style="font-family:system-ui;background:#111;color:#eee;display:flex;align-items:center;justify-content:center;min-height:100vh">
+      <form method="POST" action="/upload" enctype="multipart/form-data" style="background:#1c1c1c;padding:24px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+        <h2 style="margin-top:0">Upload shoplifting video</h2>
+        <p style="margin:.5rem 0 .75rem 0;opacity:.8">Accepted: .mp4 .mov .avi .mkv .webm</p>
+        <input type="file" name="file" accept="video/*" required>
+        <div style="height:12px"></div>
+        <button type="submit" style="padding:8px 14px;border-radius:8px;border:0;background:#27ae60;color:white;cursor:pointer">Upload & Run</button>
+      </form>
+    </body></html>
+    """
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files.get("file")
+    if not f:
+        abort(400, "No file provided")
+    name = secure_filename(f.filename or "")
+    ext  = os.path.splitext(name)[1].lower()
+    if not name or ext not in ALLOWED_EXTS:
+        abort(400, "Unsupported filename or format")
+    save_path = os.path.join(UPLOAD_DIR, name)
+    f.save(save_path)
+    print(f"📥 Uploaded: {save_path}")
+    return redirect(url_for("play", name=name))
+
+@app.route("/play/<path:name>")
+def play(name):
+    video_path = os.path.join(UPLOAD_DIR, name)
+    if not os.path.exists(video_path):
+        abort(404, f"File not found: {name}")
+    cap = cv2.VideoCapture(video_path)
+    ok = cap.isOpened(); cap.release()
+    if not ok:
+        return f"<h3 style='color:#eee;background:#111;font-family:system-ui;padding:2rem'>Could not open file: {name}. Try MP4 (H.264) or smaller resolution.</h3>", 415
+    chan = uuid.uuid4().hex
+    ALERT_QUEUES[chan] = queue.Queue(maxsize=64)
+    return f"""
+    <html><body style="margin:0;background:#111;color:#eee;font-family:system-ui">
+      <div id="toast" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#c0392b;color:#fff;padding:10px 14px;border-radius:8px;display:none;z-index:10">ALERT</div>
+      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center">
+        <img id="stream" src="/video_feed?name={name}&chan={chan}&loop=0" style="max-width:92vw;max-height:88vh"/>
+      </div>
+      <div style="position:fixed;bottom:18px;left:50%;transform:translateX(-50%);display:flex;gap:10px">
+        <button id="stopBtn" style="padding:8px 12px;border:0;border-radius:8px;background:#e74c3c;color:#fff;cursor:pointer">Stop</button>
+        <a href="" style="padding:8px 12px;border-radius:8px;background:#2ecc71;color:#fff;text-decoration:none">Replay</a>
+      </div>
+      <script>
+        const t=document.getElementById('toast');
+        const es=new EventSource('/alerts/{chan}');
+        es.onmessage=(e)=>{{ if(e.data!=='ping'){{ t.style.display='block'; t.textContent=e.data; setTimeout(()=>t.style.display='none', 5000); }} }};
+        document.getElementById('stopBtn').onclick = async () => {{
+          try {{ await fetch('/stop/{chan}', {{method:'POST'}}); }} catch(e) {{}}
+        }};
+        window.addEventListener('beforeunload', ()=>{{ try{{ navigator.sendBeacon && navigator.sendBeacon('/stop/{chan}'); }}catch(e){{}} }});
+      </script>
+    </body></html>
+    """
+
+@app.route("/stop/<chan>", methods=["POST"])
+def stop(chan):
+    STOP_FLAGS[chan] = True
+    return ("", 204)
+
+@app.route("/alerts/<chan>")
+def alerts(chan):
+    q = ALERT_QUEUES.get(chan)
+    if q is None:
+        q = queue.Queue(maxsize=64); ALERT_QUEUES[chan]=q
+    def stream():
+        while True:
+            try:
+                msg = q.get(timeout=10.0)
+                yield f"data: {msg}\n\n"
+            except queue.Empty:
+                yield "data: ping\n\n"
+    return Response(stream(), mimetype="text/event-stream")
+
+@app.route("/video_feed")
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    name = request.args.get("name")
+    chan = request.args.get("chan") or ""
+    src  = os.path.join(UPLOAD_DIR, name) if name else "0"
+    loop_arg = request.args.get("loop")
+    if loop_arg is None:
+        loop = False if name else bool(LOOP_UPLOADS)
+    else:
+        loop = loop_arg not in ("0","false","False")
+    print(f"🎥 /video_feed source={src}, loop={loop} chan={chan}")
+    return Response(generate_frames(src, chan, loop=loop),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", "80"))
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
