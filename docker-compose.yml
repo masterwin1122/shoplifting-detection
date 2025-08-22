@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  shoplifting-detection:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=${DEBUG:-false}
+      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.7}
+      - ALERT_COOLDOWN=${ALERT_COOLDOWN:-30}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./runs:/app/runs
+      - ./rois.json:/app/rois.json
+    restart: unless-stopped
+    networks:
+      - detection-network
+
+networks:
+  detection-network:
+    driver: bridge
+
